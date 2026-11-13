@@ -274,11 +274,13 @@ async def send_tg_code(code: str):
 # 兜底 转发:  没配会员 Cookie 时, 回退到转发原作者后端(需其 TG 群验证)。
 RESOLVE_MODE = os.getenv("HJ_RESOLVE_MODE", "auto")   # auto | self | relay
 MEMBER_COOKIE = os.getenv("HJ_MEMBER_COOKIE", "")
+USER_TOKEN = os.getenv("HJ_USER_TOKEN", "")
+USER_ID = os.getenv("HJ_USER_ID", "")
 UPSTREAM_BASE = os.getenv("HJ_UPSTREAM_BASE", "http://191.96.243.163:18787")
 UPSTREAM_TOKEN = os.getenv("HJ_UPSTREAM_TOKEN", APP_TOKEN)
 
-# 自研模式(服务端自带会员登录态) => 无需 TG 群验证
-SELF_MODE = bool(MEMBER_COOKIE) and RESOLVE_MODE in ("auto", "self")
+# 自研模式(服务端自带会员/购买登录态) => 无需 TG 群验证
+SELF_MODE = bool(MEMBER_COOKIE or USER_TOKEN) and RESOLVE_MODE in ("auto", "self")
 
 
 async def upstream_call(path: str, body: dict, method: str = "POST") -> dict:
@@ -314,7 +316,21 @@ async def resolve_play_url(page_url: str, device_key: str, play_token: str = "")
     log("resolve", mode=("self" if SELF_MODE else "relay"),
         device_key=device_key, page_url=page_url)
 
-    # ---- 主路径: 自研 ----
+    # ---- 主线: haijiao.com 帖子页 → hj_api 自研解析 ----
+    if "post/details" in (page_url or "") and USER_TOKEN:
+        try:
+            import hj_api
+            r = await hj_api.resolve(page_url)
+            url = r.get("full_url") or r.get("preview_url") or ""
+            if url.startswith("http"):
+                return url
+            raise RuntimeError("主线未返回播放地址")
+        except Exception as e:
+            log("hj_api_fail", err=str(e)[:160])
+            if RESOLVE_MODE == "self":
+                raise RuntimeError("主线解析失败: " + str(e)[:120])
+
+    # ---- 支线: 影院 .shop /play/{id}.html → self_resolver 自研 ----
     if SELF_MODE:
         try:
             import self_resolver

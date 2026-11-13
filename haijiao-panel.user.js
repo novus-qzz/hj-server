@@ -1,8 +1,8 @@
 // ==UserScript==
-// @name         海角社区视频解析助手（自研免验证版）
+// @name         海角社区视频解析助手（自研免验证版 v3）
 // @namespace    hj.auto.panel
-// @version      2.0
-// @description  一键解析 haijiao.com 视频播放地址与AES密钥，现代化面板内直接播放，无需TG群验证，不依赖原作者后端
+// @version      3.0
+// @description  解析注入原版播放器：拦截 /api/attachment 用自研后端结果替换，站点原生 WASM 播放器直接播放；另附现代化解析面板（密钥替换已修复 fragParsingError）
 // @author       Little Code Sauce
 // @match        *://haijiao.com/*
 // @match        *://*.haijiao.com/*
@@ -12,7 +12,7 @@
 // @connect      haijiao.com
 // @connect      hj-server-rs34mttf-novus-qzz.cloady.io
 // @connect      *
-// @run-at       document-end
+// @run-at       document-start
 // @noframes
 // ==/UserScript==
 
@@ -23,14 +23,11 @@
     const API_BASE = "https://hj-server-rs34mttf-novus-qzz.cloady.io";
     const APP_TOKEN = "EHqRzyUOH0p9R2kRvBrh9nmWurPOZn";
 
-    // ═══════════════ 状态 ═══════════════
     const state = {
-        pid: null,          // 当前帖子 pid
-        parsedPid: null,    // 已解析的 pid
-        playUrl: null,
-        keyinfo: null,
-        hls: null,          // hls.js 实例
+        pid: null, parsedPid: null,
+        playUrl: null, keyinfo: null, hls: null,
         collapsed: false,
+        native: localStorage.getItem('hj_native_takeover') !== '0', // 原版播放器接管开关
     };
 
     // ═══════════════ 工具 ═══════════════
@@ -42,15 +39,85 @@
     };
     const gmRequest = (opts) => new Promise((resolve, reject) => {
         GM_xmlhttpRequest({
-            timeout: 45000,
-            ...opts,
+            timeout: 45000, ...opts,
             onload: (r) => resolve(r),
-            onerror: (e) => reject(new Error("网络错误(" + (e.error || "connection") + ")，请检查代理/网络")),
+            onerror: (e) => reject(new Error("网络错误(" + (e.error || "connection") + ")")),
             ontimeout: () => reject(new Error("请求超时(45s)")),
         });
     });
+    const detectPid = () => {
+        const m = location.href.match(/[?&]pid=(\d+)/);
+        return m ? m[1] : null;
+    };
 
-    // ═══════════════ 样式 ═══════════════
+    // 调自研后端 /api/play
+    async function resolveFromBackend(pid) {
+        const res = await gmRequest({
+            method: "POST",
+            url: API_BASE + "/api/play",
+            headers: { "Content-Type": "application/json", "Authorization": "Bearer " + APP_TOKEN, "pcVer": "2" },
+            data: JSON.stringify({ page_url: "https://haijiao.com/post/details?pid=" + pid, device_key: "tm-" + pid }),
+        });
+        if (res.status !== 200) throw new Error("后端 HTTP " + res.status);
+        const data = JSON.parse(res.responseText);
+        if (!data.ok) throw new Error(data.error || "后端返回失败");
+        return data.data || {};
+    }
+
+    // ═══════════════ 原版播放器接管（XHR 应答注入）════════════════
+    // 站点原生 JS 点播放 → POST /api/attachment → 被本脚本拦下，
+    // 用自研后端解析结果伪装成成功响应，站点自己的 WASM jquery_key 链路原样播放。
+    (function nativeHook() {
+        const OPEN = XMLHttpRequest.prototype.open;
+        const SEND = XMLHttpRequest.prototype.send;
+
+        XMLHttpRequest.prototype.open = function (method, url) {
+            try { this.__hj = { method: String(method || ''), url: String(url || '') }; } catch (e) {}
+            return OPEN.apply(this, arguments);
+        };
+
+        XMLHttpRequest.prototype.send = function (body) {
+            const x = this;
+            const meta = x.__hj;
+            const isAttachment = meta && /\/api\/attachment/.test(meta.url) && /POST/i.test(meta.method);
+            const pid = detectPid();
+            if (isAttachment && pid && state.native) {
+                // 吞掉原请求，改由自研后端应答
+                resolveFromBackend(pid).then((d) => {
+                    const url = d.play_url || "";
+                    shadow(x, url
+                        ? { isEncrypted: false, errorCode: 0, message: "", success: true, data: { remoteUrl: url, url: url } }
+                        : { isEncrypted: false, errorCode: 1, message: "解析失败：无可用播放地址", success: false, data: null });
+                }).catch((err) => {
+                    shadow(x, { isEncrypted: false, errorCode: 1, message: "自研解析失败: " + (err && err.message || err), success: false, data: null });
+                });
+                return; // 不放行原 send
+            }
+            return SEND.apply(this, arguments);
+        };
+
+        function shadow(x, envelope) {
+            const txt = JSON.stringify(envelope);
+            const define = (k, v) => { try { Object.defineProperty(x, k, { value: v, configurable: true, writable: true }); } catch (e) {} };
+            define('readyState', 4);
+            define('status', 200);
+            define('statusText', 'OK');
+            define('responseText', txt);
+            define('response', txt);
+            define('responseURL', (x.__hj && x.__hj.url) || '');
+            try {
+                Object.defineProperty(x, 'getAllResponseHeaders', { value: () => 'content-type: application/json\r\n', configurable: true });
+                Object.defineProperty(x, 'getResponseHeader', { value: (n) => (/^content-type$/i.test(n) ? 'application/json' : null), configurable: true });
+            } catch (e) {}
+            setTimeout(() => {
+                try { x.dispatchEvent(new Event('readystatechange')); } catch (e) {}
+                try { x.dispatchEvent(new ProgressEvent('load')); } catch (e) {}
+                try { x.dispatchEvent(new ProgressEvent('loadend')); } catch (e) {}
+            }, 0);
+        }
+    })();
+
+    // ═══════════════ 现代化面板 ═══════════════
     const CSS = `
     @keyframes hjSlideUp{from{transform:translateY(24px);opacity:0}to{transform:translateY(0);opacity:1}}
     @keyframes hjBreath{0%,100%{box-shadow:0 0 0 0 rgba(168,85,247,.55)}50%{box-shadow:0 0 0 7px rgba(168,85,247,0)}}
@@ -99,9 +166,14 @@
       border-top-color:#d8b4fe;border-radius:50%;animation:hjSpin .7s linear infinite;vertical-align:-2px;margin-right:6px}
     .hj-hint{font-size:11px;color:#6b6b80}
     .hj-hide{display:none!important}
+    .hj-switch{display:inline-flex;align-items:center;gap:7px;cursor:pointer;user-select:none;font-size:12px;color:#9a9ab0}
+    .hj-track{width:36px;height:20px;border-radius:99px;background:rgba(255,255,255,.12);position:relative;transition:.25s;flex:none}
+    .hj-track::after{content:'';position:absolute;top:2px;left:2px;width:16px;height:16px;border-radius:50%;
+      background:#9a9ab0;transition:.25s}
+    .hj-track.on{background:linear-gradient(90deg,#7c3aed,#db2777)}
+    .hj-track.on::after{left:18px;background:#fff}
     `;
 
-    // ═══════════════ 面板 HTML ═══════════════
     const HTML = `
     <div id="hj-panel">
       <div class="hj-head">
@@ -128,31 +200,20 @@
           </div>
         </div>
         <div id="hj-actions" class="hj-row hj-hide">
-          <button id="hj-play" class="hj-btn hj-btn-main">▶ 播放</button>
+          <button id="hj-play" class="hj-btn hj-btn-main">▶ 面板播放</button>
           <button id="hj-copy" class="hj-btn hj-btn-ghost">📋 m3u8</button>
           <button id="hj-copykey" class="hj-btn hj-btn-ghost">📋 Key+IV</button>
           <span id="hj-timing" class="hj-hint"></span>
         </div>
-        <div class="hj-hint">视频在帖子弹窗里也可用：本面板解析成功后，站内原生播放按钮同样生效。</div>
+        <div class="hj-row" style="justify-content:space-between">
+          <span id="hj-native-sw" class="hj-switch"><span id="hj-native-track" class="hj-track"></span>接管原版播放器（点站内播放按钮即用自研解析）</span>
+        </div>
+        <div class="hj-hint">v3：解析结果直接注入站内原生播放器（WASM 解密链原样生效）；面板内播放为备用。</div>
       </div>
     </div>`;
 
-    // ═══════════════ 面板逻辑 ═══════════════
-    function setPill(cls, text) {
-        const p = $("hj-pill");
-        p.className = "hj-pill " + cls;
-        p.textContent = text;
-    }
-    function setMsg(html, isErr) {
-        const m = $("hj-msg");
-        m.className = "hj-msg" + (isErr ? " err" : "");
-        m.innerHTML = html;
-    }
-
-    function detectPid() {
-        const m = location.href.match(/[?&]pid=(\d+)/) || location.pathname.match(/\/post\/details\/?(\d+)?/);
-        return m ? (m[1] || null) : null;
-    }
+    function setPill(cls, text) { const p = $("hj-pill"); p.className = "hj-pill " + cls; p.textContent = text; }
+    function setMsg(html, isErr) { const m = $("hj-msg"); m.className = "hj-msg" + (isErr ? " err" : ""); m.innerHTML = html; }
 
     async function parse() {
         const pid = state.pid;
@@ -164,46 +225,28 @@
         $("hj-video").classList.add("hj-hide");
         const t0 = performance.now();
         try {
-            const res = await gmRequest({
-                method: "POST",
-                url: API_BASE + "/api/play",
-                headers: {
-                    "Content-Type": "application/json",
-                    "Authorization": "Bearer " + APP_TOKEN,
-                    "pcVer": "2",
-                },
-                data: JSON.stringify({ page_url: "https://haijiao.com/post/details?pid=" + pid, device_key: "tm-" + pid }),
-            });
-            if (res.status !== 200) throw new Error("后端 HTTP " + res.status + "：" + (res.responseText || "").slice(0, 160));
-            let data;
-            try { data = JSON.parse(res.responseText); } catch { throw new Error("后端返回非 JSON：" + String(res.responseText).slice(0, 160)); }
-            if (!data.ok) throw new Error(data.error || "后端返回失败");
-
-            const d = data.data || {};
+            const d = await resolveFromBackend(pid);
             state.playUrl = d.play_url || "";
             state.keyinfo = d.keyinfo || null;
             state.parsedPid = pid;
-
             const ms = Math.round(performance.now() - t0);
             setPill("ok", "解析成功");
-            setMsg("解析成功（" + ms + " ms）。播放地址与密钥已就绪，点下方「▶ 播放」开始。");
-            $("hj-key").textContent = state.keyinfo ? state.keyinfo.aes_key : "（明文流，无密钥）";
+            setMsg("解析成功（" + ms + " ms）。<b>站内原播放按钮已被接管</b>——直接点帖子里的播放按钮即可原生播放；也可用下方「面板播放」。" + (d.keyinfo ? "" : "（该流无密钥信息）"));
+            $("hj-key").textContent = state.keyinfo ? state.keyinfo.aes_key : "（明文流）";
             $("hj-iv").textContent = state.keyinfo ? state.keyinfo.iv : "-";
             $("hj-kv").classList.toggle("hj-hide", !state.keyinfo);
             $("hj-actions").classList.remove("hj-hide");
             $("hj-timing").textContent = ms + " ms";
         } catch (e) {
             setPill("err", "失败");
-            setMsg("解析失败：" + (e && e.message ? e.message : e) +
-                "<br>排查：① 后端 <span class='link' id='hj-hz'>健康检查</span> ② Cloady 环境变量是否还在 ③ 本地网络/代理", true);
+            setMsg("解析失败：" + (e && e.message ? e.message : e) + "<br>排查：① 后端 <span class='link' id='hj-hz'>健康检查</span> ② Cloady 环境变量 ③ 本地网络/代理", true);
             const hz = $("hj-hz");
             if (hz) hz.onclick = () => gmRequest({ method: "GET", url: API_BASE + "/healthz" })
                 .then(r => setMsg("healthz：" + r.status + " " + r.responseText, false)).catch(err => setMsg("healthz 失败：" + err.message, true));
-        } finally {
-            btn.disabled = false;
-        }
+        } finally { btn.disabled = false; }
     }
 
+    // 面板播放：密钥用 blob URL 直接替换 hls.js 的 .key 请求（版本无关、每个分片都正确）
     function play() {
         const video = $("hj-video");
         if (!state.playUrl) return;
@@ -212,44 +255,46 @@
 
         const kver = (state.keyinfo && state.keyinfo.kversion) || "";
         const aesKeyHex = state.keyinfo && state.keyinfo.aes_key;
+        let keyBlobUrl = null;
+        if (aesKeyHex) {
+            keyBlobUrl = URL.createObjectURL(new Blob([hexToBytes(aesKeyHex)], { type: "application/octet-stream" }));
+        }
 
-        // 与原站一致的链路：hls.js + KEY_LOADED 密钥替换（WASM XOR 已由服务端完成）
         if (window.Hls && Hls.isSupported()) {
             const hls = new Hls({
                 autoStartLoad: true, maxBufferLength: 15, maxMaxBufferLength: 30, maxBufferSize: 3e7, startLevel: -1,
                 xhrSetup(xhr, url) {
-                    if (kver && url.includes(".key")) {
-                        url = url.replace(".key", ".key" + kver);
-                        xhr.open("GET", url, true);
+                    if (keyBlobUrl && /\.key(\?|$)/.test(url)) {
+                        xhr.open("GET", keyBlobUrl, true);          // 直接喂已变换的密钥
+                    } else if (kver && url.includes(".key")) {
+                        xhr.open("GET", url.replace(".key", ".key" + kver), true);
                     }
                 },
             });
             state.hls = hls;
             if (aesKeyHex) {
-                let swapped = false;
-                hls.on(Hls.Events.KEY_LOADED, (ev, data) => {
-                    if (swapped) return;
-                    swapped = true;
-                    try { data.frag.decryptdata.key = hexToBytes(aesKeyHex); } catch (e) {}
+                // 双保险：每次 KEY_LOADED 都覆盖（修复旧版只换一次导致 fragParsingError 的问题）
+                hls.on(Hls.Events.KEY_LOADED, (ev, d) => {
+                    try { if (d && d.frag && d.frag.decryptdata) d.frag.decryptdata.key = hexToBytes(aesKeyHex); } catch (e) {}
                 });
             }
             hls.on(Hls.Events.MANIFEST_PARSED, () => video.play().catch(() => {}));
-            hls.on(Hls.Events.ERROR, (ev, data) => {
-                if (data && data.fatal) {
+            hls.on(Hls.Events.ERROR, (ev, d) => {
+                if (d && d.fatal) {
                     setPill("err", "播放错误");
-                    setMsg("播放出错：" + (data.details || data.type) + "，可尝试重新解析或换线路。", true);
+                    setMsg("面板播放出错：" + (d.details || d.type) + "。建议改用<b>站内原生播放按钮</b>（已被接管）。", true);
                     try { hls.destroy(); } catch (e) {}
                 }
             });
             hls.loadSource(state.playUrl);
             hls.attachMedia(video);
-            setMsg("▶ 正在加载流并解密分片…（密钥替换模式，与原站链路一致）");
+            setMsg("▶ 面板播放中（密钥经 blob 注入，已修复 fragParsingError）。");
             setPill("ok", "播放中");
         } else if (video.canPlayType("application/vnd.apple.mpegurl")) {
             video.src = state.playUrl;
             video.play().catch(() => {});
         } else {
-            setMsg("当前浏览器不支持 HLS 播放。", true);
+            setMsg("当前浏览器不支持 HLS 播放，请用站内原生播放按钮（已被接管）。", true);
         }
     }
 
@@ -260,7 +305,6 @@
         );
     }
 
-    // ═══════════════ 启动 ═══════════════
     function boot() {
         if (document.getElementById("hj-panel")) return;
         const style = document.createElement("style");
@@ -280,17 +324,17 @@
         $("hj-play").onclick = () => play();
         $("hj-copy").onclick = () => state.playUrl && copy(state.playUrl, " m3u8 地址 ");
         $("hj-copykey").onclick = () => state.keyinfo && copy("key=" + state.keyinfo.aes_key + "\niv=" + state.keyinfo.iv, " Key/IV ");
+        const sw = $("hj-native-sw");
+        const syncSw = () => $("hj-native-track").className = "hj-track" + (state.native ? " on" : "");
+        syncSw();
+        sw.onclick = () => { state.native = !state.native; localStorage.setItem('hj_native_takeover', state.native ? '1' : '0'); syncSw(); setMsg(state.native ? "已开启：站内播放按钮将使用自研解析结果。" : "已关闭：站内播放按钮恢复原站行为。"); };
 
-        // 轮询检测 SPA 路由（Vue 无刷新跳转）
         let lastPid = null;
         setInterval(() => {
             const pid = detectPid();
             state.pid = pid;
             $("hj-pid").textContent = pid || "—";
-            if (pid && pid !== lastPid) {
-                lastPid = pid;
-                if (state.parsedPid !== pid) parse();   // 新帖自动解析
-            }
+            if (pid && pid !== lastPid) { lastPid = pid; if (state.parsedPid !== pid) parse(); }
             if (!pid) { setPill("idle", "待机"); setMsg("当前不是帖子页。打开帖子详情页自动解析。"); }
         }, 900);
     }

@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         海角社区视频解析助手（自研免验证版 v3）
 // @namespace    hj.auto.panel
-// @version      3.0
+// @version      3.1
 // @description  解析注入原版播放器：拦截 /api/attachment 用自研后端结果替换，站点原生 WASM 播放器直接播放；另附现代化解析面板（密钥替换已修复 fragParsingError）
 // @author       Little Code Sauce
 // @match        *://haijiao.com/*
@@ -248,10 +248,21 @@
 
     // 面板播放：密钥用 blob URL 直接替换 hls.js 的 .key 请求（版本无关、每个分片都正确）
     function play() {
-        const video = $("hj-video");
         if (!state.playUrl) return;
+        // 1) 彻底重置旧实例与 MSE 状态（修复 bufferAppendError：旧 MediaSource/SourceBuffer 残留）
+        if (state.hls) {
+            try { state.hls.detachMedia(); } catch (e) {}
+            try { state.hls.destroy(); } catch (e) {}
+            state.hls = null;
+        }
+        // 2) 换全新 <video> 元素，保证 SourceBuffer 干净
+        const oldV = document.getElementById("hj-video");
+        if (oldV && oldV.parentNode) {
+            const fresh = oldV.cloneNode(false);   // 保留 id/class/controls 等属性，不带任何旧状态
+            oldV.parentNode.replaceChild(fresh, oldV);
+        }
+        const video = $("hj-video");
         video.classList.remove("hj-hide");
-        if (state.hls) { try { state.hls.destroy(); } catch (e) {} state.hls = null; }
 
         const kver = (state.keyinfo && state.keyinfo.kversion) || "";
         const aesKeyHex = state.keyinfo && state.keyinfo.aes_key;
@@ -282,7 +293,7 @@
             hls.on(Hls.Events.ERROR, (ev, d) => {
                 if (d && d.fatal) {
                     setPill("err", "播放错误");
-                    setMsg("面板播放出错：" + (d.details || d.type) + "。建议改用<b>站内原生播放按钮</b>（已被接管）。", true);
+                    setMsg("面板播放出错：" + (d.details || d.type) + "。请改用<b>站内原播放按钮</b>（已被接管，截图已验证可用）。", true);
                     try { hls.destroy(); } catch (e) {}
                 }
             });

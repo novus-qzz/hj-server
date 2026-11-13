@@ -9,6 +9,7 @@ import hmac
 import json
 import logging
 import os
+import re
 import secrets
 import time
 import uuid
@@ -266,11 +267,18 @@ async def send_tg_code(code: str):
         log("tg_send_fail", err=str(e))
 
 
-# ═══════════════════════ 解析 worker — 转发原版后端 ═══════════════════════
-# 把原版作者的后端当解析上游: 我们的 /api/play → 他的 /api/play (用他的 APP_TOKEN)
-# 他的后端有群验证逻辑, 我们把 play_token 原样透传, 由它决定放不放行。
+# ═══════════════════════ 解析 worker — 自研优先 / 转发兜底 ═══════════════════════
+# 主路径 自研: self_resolver.resolve() 自己发现域名 + 过 18+ 门 + 抓播放页提取 m3u8,
+#             完全不依赖原作者后端。需要 HJ_MEMBER_COOKIE (会员登录态):
+#             实测播放页是服务端 SSR, 未登录不下发任何 m3u8, 这是账号鉴权, 前端绕不过。
+# 兜底 转发:  没配会员 Cookie 时, 回退到转发原作者后端(需其 TG 群验证)。
+RESOLVE_MODE = os.getenv("HJ_RESOLVE_MODE", "auto")   # auto | self | relay
+MEMBER_COOKIE = os.getenv("HJ_MEMBER_COOKIE", "")
 UPSTREAM_BASE = os.getenv("HJ_UPSTREAM_BASE", "http://191.96.243.163:18787")
 UPSTREAM_TOKEN = os.getenv("HJ_UPSTREAM_TOKEN", APP_TOKEN)
+
+# 自研模式(服务端自带会员登录态) => 无需 TG 群验证
+SELF_MODE = bool(MEMBER_COOKIE) and RESOLVE_MODE in ("auto", "self")
 
 
 async def upstream_call(path: str, body: dict, method: str = "POST") -> dict:
@@ -302,12 +310,26 @@ async def upstream_call(path: str, body: dict, method: str = "POST") -> dict:
 
 
 async def resolve_play_url(page_url: str, device_key: str, play_token: str = "") -> str:
-    """
-    转发模式: 把 page_url + play_token 交给原版后端解析。
-    原版会校验它的群验证 token —— 所以前端必须先在我们的 verify/start 里
-    拿到码去他的 bot 加群(verification 流程兼容: 我们也透传他的 bot_url)。
-    """
-    log("resolve", device_key=device_key, page_url=page_url)
+    """自研优先, 缺会员 Cookie 时回退转发原作者后端。"""
+    log("resolve", mode=("self" if SELF_MODE else "relay"),
+        device_key=device_key, page_url=page_url)
+
+    # ---- 主路径: 自研 ----
+    if SELF_MODE:
+        try:
+            import self_resolver
+            self_resolver.MEMBER_COOKIE = MEMBER_COOKIE
+            vid = ""
+            m = re.search(r"/play/(\d+)\.html", page_url or "")
+            if m:
+                vid = m.group(1)
+            return await self_resolver.resolve(video_id=vid, page_url=page_url)
+        except Exception as e:
+            log("self_resolve_fail", err=str(e)[:160])
+            if RESOLVE_MODE == "self":
+                raise RuntimeError("自研解析失败: " + str(e)[:120])
+
+    # ---- 兜底: 转发原作者后端 ----
     data = await upstream_call(
         "/api/play",
         {"page_url": page_url, "device_key": device_key, "play_token": play_token},
@@ -429,7 +451,8 @@ async def handle_play(request: web.Request):
         return web.json_response(
             {"ok": False, "error": f"请求过于频繁，请 {wait:.0f} 秒后重试"}, status=429
         )
-    if not await db_play_token_ok(device_key, play_token):
+    # 自研模式(服务端自带会员登录态)直接放行, 不需要 TG 群验证
+    if not SELF_MODE and not await db_play_token_ok(device_key, play_token):
         return err("需要群验证，请先加群", 403)
 
     try:

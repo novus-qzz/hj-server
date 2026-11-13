@@ -1,18 +1,19 @@
-# Cloady 应用 → Settings → Environment 需要配置的变量
-# (前三个已有，保留；新增最后两个即可)
+# 海角社区自研解析器 — Cloady 环境变量参考
+# 部署后在 Cloady 后台 → 环境变量 里按需填写，再 Redeploy。
 
-HJ_APP_TOKEN=EHqRzyUOH0p9R2kRvBrh9nmWurPOZn
-HJ_HMAC_KEY=a3f5c8e1b7d94f2a6c0e5b8d1f4a7c9e2b6d0f3a5c8e1b7d94f2a6c0e5b8d1f4
-HJ_TG_BOT_USERNAME=haijiao_helper_bot
-
-# ↓↓↓ 新增：会员登录态 + 强制自研模式 ↓↓↓
-HJ_MEMBER_COOKIE=<把 cookie-export.js 复制出来的整串粘这里>
+# 用户身份（必填，决定是否跳过 TG 验证并能拿到完整 m3u8）
+# 来源：haijiao.com 登录后 F12 Console 运行 f12_export_token.js
+HJ_USER_TOKEN=你的_X-User-Token
+HJ_USER_ID=你的_X-User-Id
 HJ_RESOLVE_MODE=self
 
-# 说明：
-#  - 配了 HJ_MEMBER_COOKIE + HJ_RESOLVE_MODE=self 后：
-#      · 走自研解析(自己发现域名/过18+门/抓播放页提 m3u8)
-#      · 自动跳过 Telegram 群验证
-#      · 完全不依赖原作者后端
-#  - Cookie 失效时服务端会判定"会员专享"，解析器会明确报错
-#  - 换 Cookie 后需 Redeploy 一次(环境变量变更重启)
+# 原作者后端兼容 token（给旧油猴脚本用）
+HJ_APP_TOKEN=EHqRzyUOH0p9R2kRvBrh9nmWurPOZn
+
+# 站点（可选）
+HJ_SITE=https://haijiao.com
+
+# 可选：固定 salt（若站点 .jpg 密钥随时间变化，此处留空即按每次 m3u8 实时推算）
+# HJ_KEY_SALT=
+
+# PaaS 会自动注入 PORT；如本地测试请设 HJ_PORT=18787

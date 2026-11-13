@@ -18,6 +18,69 @@ from dataclasses import dataclass, field
 import aiohttp
 from aiohttp import web
 
+# ═══════════════════════ 播放器密钥链（haijiao.com 自研）═════════════════════════════
+# 海角站点播放器真实链路（app.js 逆向，已实测通过）：
+#   1) m3u8 替换后缀为 .jpg，抓取文本 → Base64 解码 = salt
+#   2) m3u8 中 #EXT-X-KEY URI 指向 .key(kversion) → 抓取密文
+#   3) AES-128 key = salt 循环异或 密文（WASM jquery_key = XOR，已实测）
+#   4) hls.js 用该 AES key/CBC IV 解密 TS 分片；.key 请求改写为 .key{kversion}
+# 这些由服务端统一返回，前端/油猴脚本无需再自己跑 WASM。
+KEY_SALT = os.getenv("HJ_KEY_SALT", "")   # 可选：若固定 salt 不随 jpg 变化，可在此配
+
+
+def _xor_cyclic(key: bytes, salt: bytes) -> bytes:
+    """jquery_key 变换的等价实现：循环异或（实测 1:1）。"""
+    return bytes(b ^ salt[i % len(salt)] for i, b in enumerate(key))
+
+
+SITE_BASE = os.getenv("HJ_SITE", "https://haijiao.com")
+
+async def _derive_key_info(m3u8_url: str) -> dict:
+    """
+    从 m3u8 推算 AES-128 密钥信息，供播放器直接使用。
+    返回 {aes_key_hex, iv_hex, key_uri, salt_b64, kversion}
+    需要 requests（同步）且被 haijiao.com Cloudflare 拦截 → 走线程池。
+    """
+    import asyncio as _aio, re as _re, base64 as _b64
+
+    def _sync():
+        import requests
+        sess = requests.Session()
+        sess.headers.update({
+            "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                           "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"),
+            "Referer": SITE_BASE,
+        })
+        m3u8 = sess.get(m3u8_url, timeout=12).text
+        mv = _re.search(r'#EXT-X-KEY:METHOD=AES-128,URI="([^"]+)"', m3u8)
+        iv = None
+        miv = _re.search(r'IV=0x([0-9a-fA-F]+)', m3u8)
+        if miv:
+            iv = bytes.fromhex(miv.group(1))
+        key_uri = mv.group(1) if mv else ""
+        # key 内容可能是 base64 或原始二进制，先按 base64 解，不行则原样
+        key_raw = sess.get(m3u8_url.rsplit("/", 1)[0] + "/" + key_uri, timeout=12).content if key_uri else b""
+        try:
+            key_dec = base64.b64decode(key_raw.strip())
+        except Exception:
+            key_dec = key_raw
+        # salt 来自 .jpg
+        jpg = sess.get(m3u8_url.replace(".m3u8", ".jpg"), timeout=12).text.strip()
+        try:
+            salt = base64.b64decode(jpg)
+        except Exception:
+            salt = jpg.encode("utf-8", "replace")
+        aes_key = _xor_cyclic(key_dec[:16], salt) if key_dec and salt else b""
+        return {
+            "aes_key_hex": aes_key.hex(),
+            "iv_hex": iv.hex() if iv else "",
+            "key_uri": key_uri,
+            "salt_b64": _b64.b64encode(salt).decode() if salt else "",
+            "key_len": len(aes_key),
+        }
+
+    return await _aio.to_thread(_sync)
+
 # ═══════════════════════ 配置 ═══════════════════════
 # PaaS (Cloady) 会注入 PORT；本机/VPS 用 HJ_PORT；默认 18787
 LISTEN_PORT = int(os.getenv("PORT") or os.getenv("HJ_PORT") or "18787")
@@ -489,7 +552,24 @@ async def handle_play(request: web.Request):
         return err(msg, 502)
     await db_log_play(device_key, page_url, play_url)
     log("play", device_key=device_key, page_url=page_url, ip=client_ip(request))
-    return ok({"play_url": play_url})
+    payload = {"play_url": play_url}
+    # 附带自研密钥链，播放器直接用，无需 TG 群验证 / 无需原作者后端
+    if "post/details" in page_url and USER_TOKEN:
+        try:
+            preview = play_url if play_url.endswith(".m3u8") else ""
+            if preview:
+                ki = await _derive_key_info(preview)
+                payload["keyinfo"] = {
+                    "m3u8": preview,
+                    "aes_key": ki["aes_key_hex"],
+                    "iv": ki["iv_hex"],
+                    "key_uri": ki["key_uri"],
+                    "salt_b64": ki["salt_b64"],
+                    "kversion": "",  # 站点 /login/conf 当前 kversion 为空；若启用则按 .key{kversion} 改写
+                }
+        except Exception as e:
+            log("keyinfo_fail", err=str(e)[:120])
+    return ok(payload)
 
 
 # ═══════════════════════ App 装配 ═══════════════════════

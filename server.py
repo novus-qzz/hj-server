@@ -266,14 +266,56 @@ async def send_tg_code(code: str):
         log("tg_send_fail", err=str(e))
 
 
-# ═══════════════════════ 解析 worker (占位，可接代理池/播放源) ═══════════════════════
-# 真实逻辑: 收到 page_url → 代理池抓页面 → 提取 m3u8 → 返回
-# 这里给出结构，函数体接你自己的解析源
-async def resolve_play_url(page_url: str, device_key: str) -> str:
-    # TODO: 接入解析源，如 需要代理: 见 proxy_pool.py
-    # demo: 直接返回一个测试流
+# ═══════════════════════ 解析 worker — 转发原版后端 ═══════════════════════
+# 把原版作者的后端当解析上游: 我们的 /api/play → 他的 /api/play (用他的 APP_TOKEN)
+# 他的后端有群验证逻辑, 我们把 play_token 原样透传, 由它决定放不放行。
+UPSTREAM_BASE = os.getenv("HJ_UPSTREAM_BASE", "http://191.96.243.163:18787")
+UPSTREAM_TOKEN = os.getenv("HJ_UPSTREAM_TOKEN", APP_TOKEN)
+
+
+async def upstream_call(path: str, body: dict, method: str = "POST") -> dict:
+    """调原版后端, 返回其 data 或抛异常(带 error 文案)"""
+    url = UPSTREAM_BASE.rstrip("/") + path
+    headers = {
+        "Content-Type": "application/json",
+        "Authorization": "Bearer " + UPSTREAM_TOKEN,
+        "User-Agent": "hj-relay/1.0",
+    }
+    async with aiohttp.ClientSession() as s:
+        try:
+            async with s.request(
+                method, url, json=body if method != "GET" else None,
+                headers=headers, timeout=aiohttp.ClientTimeout(total=20),
+            ) as r:
+                try:
+                    payload = await r.json(content_type=None)
+                except Exception:
+                    payload = None
+                if r.status < 300 and payload and payload.get("ok"):
+                    return payload.get("data") or {}
+                msg = (payload or {}).get("error") or f"upstream {r.status}"
+                raise RuntimeError(msg)
+        except asyncio.TimeoutError:
+            raise RuntimeError("上游解析超时，请稍后重试")
+        except aiohttp.ClientError as e:
+            raise RuntimeError("上游网络异常: " + str(e)[:80])
+
+
+async def resolve_play_url(page_url: str, device_key: str, play_token: str = "") -> str:
+    """
+    转发模式: 把 page_url + play_token 交给原版后端解析。
+    原版会校验它的群验证 token —— 所以前端必须先在我们的 verify/start 里
+    拿到码去他的 bot 加群(verification 流程兼容: 我们也透传他的 bot_url)。
+    """
     log("resolve", device_key=device_key, page_url=page_url)
-    return "https://test-streams.mux.dev/x36xhzz/x36xhzz.m3u8"
+    data = await upstream_call(
+        "/api/play",
+        {"page_url": page_url, "device_key": device_key, "play_token": play_token},
+    )
+    url = str((data or {}).get("play_url") or (data or {}).get("url") or "").strip()
+    if not url.startswith("http"):
+        raise RuntimeError("上游没有返回可播放地址")
+    return url
 
 
 # ═══════════════════════ HTTP Handlers ═══════════════════════
@@ -390,7 +432,22 @@ async def handle_play(request: web.Request):
     if not await db_play_token_ok(device_key, play_token):
         return err("需要群验证，请先加群", 403)
 
-    play_url = await resolve_play_url(page_url, device_key)
+    try:
+        play_url = await resolve_play_url(page_url, device_key, play_token)
+    except RuntimeError as e:
+        msg = str(e)
+        # 上游说验证失效 → 清我们的 token, 让前端重新走验证
+        if "验证" in msg or "群" in msg:
+            async with _db_lock:
+                conn = _db()
+                conn.execute(
+                    "UPDATE verify_codes SET verified=0, play_token=NULL WHERE device_key=? AND verified=1",
+                    (device_key,),
+                )
+                conn.commit()
+                conn.close()
+            return err(msg, 403)
+        return err(msg, 502)
     await db_log_play(device_key, page_url, play_url)
     log("play", device_key=device_key, page_url=page_url, ip=client_ip(request))
     return ok({"play_url": play_url})

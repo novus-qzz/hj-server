@@ -1,4 +1,0 @@
-{"ts": 1794556148.273, "level": "INFO", "msg": "server_start", "module": "server", "port": 18788}
-{"ts": 1794556149.116, "level": "INFO", "msg": "device_register", "module": "server", "device_key": "test-lead-001", "serial": "964180E4", "ip": "127.0.0.1"}
-{"ts": 1794556149.418, "level": "INFO", "msg": "device_register", "module": "server", "device_key": "test-lead-001", "serial": "964180E4", "ip": "127.0.0.1"}
-{"ts": 1794556149.541, "level": "INFO", "msg": "verify_start", "module": "server", "device_key": "test-lead-001", "code": "93FPJL", "ip": "127.0.0.1"}
